@@ -83,6 +83,48 @@ model it fits (k=49), and prints the elbow value without using it. In this versi
 
 ---
 
+## How the Pipeline Works
+
+The DAG is defined in `dags/customer_segmentation.py`. Each task is a
+`PythonOperator` that calls one function from `dags/src/lab.py`. A function's return
+value is stored by Airflow as an XCom, and the next task receives it through
+`<task>.output` in `op_args`:
+
+```python
+data_preprocessing_task = PythonOperator(
+    task_id='data_preprocessing_task',
+    python_callable=data_preprocessing,
+    op_args=[load_data_task.output],
+)
+
+load_data_task >> data_preprocessing_task >> build_save_model_task >> load_model_task
+```
+
+XCom stores JSON, so DataFrames and arrays are pickled and base64-encoded into a
+string (`to_b64` / `from_b64` in `lab.py`). Only the customer table (4,338 rows)
+goes through XCom, never the 541,909 raw transactions. Files that later tasks or
+people need (model, preprocessor, reports) are written to `working_data/`.
+
+| Task | Function | Receives | What it does | Returns (XCom) | Writes |
+|---|---|---|---|---|---|
+| `load_data_task` | `load_data()` | nothing | Reads `online_retail.csv.gz`, removes bad rows, builds recency, frequency and monetary per customer | customer RFM table | |
+| `data_preprocessing_task` | `data_preprocessing(data)` | RFM table | Splits customers 80/20, fits log + standard scaling on the train customers | scaled train and holdout arrays | `preprocessor.pkl`, `customers_rfm.csv` |
+| `build_save_model_task` | `build_save_model(data, "model.sav")` | scaled arrays | Fits K-Means for k = 2 to 10, picks k with the elbow method, refits and saves | SSE and silhouette for every k, chosen k | `model.sav` |
+| `load_model_task` | `load_model_elbow("model.sav", scores)` | scores from the previous task | Assigns every customer a segment, checks the holdout silhouette, names the segments, predicts `test.csv` | segment names for the test customers | `segment_report.json`, `customer_segments.csv` |
+
+DAG settings:
+
+| Setting | Value | Why |
+|---|---|---|
+| `dag_id` | `Customer_Segmentation_RFM` | Name shown in the UI |
+| `schedule` | `@weekly` | Refresh the segments as new orders come in |
+| `start_date` | 2026-10-01 | |
+| `catchup` | `False` | Only run the latest week, not every week since the start date |
+| `max_active_runs` | 1 | Runs write the same files in `working_data/`, so one at a time |
+| `retries` / `retry_delay` | 1 / 2 minutes | Retry a failed task once |
+
+---
+
 ## Results
 
 The elbow of the SSE curve is at **k = 5**.
@@ -140,8 +182,10 @@ New customers from `test.csv`:
 │   └── data/
 │       ├── online_retail.csv.gz
 │       └── test.csv
-├── tests/                      # pytest tests
-├── assets/                     # Airflow UI screenshot
+├── tests/
+│   ├── test_lab.py             # cleaning, features, segment names, full pipeline
+│   └── test_dag.py             # DAG loads, task order, settings (needs Airflow)
+├── assets/                     # Airflow UI screenshots
 └── .github/workflows/tests.yml # runs the tests on every push
 ```
 
@@ -150,45 +194,170 @@ filled by Airflow.
 
 ---
 
+## Airflow Services
+
+`docker-compose.yaml` is the official Airflow 3.3.2 file with the CeleryExecutor.
+`docker compose up` starts these containers:
+
+| Service | Role |
+|---|---|
+| `postgres` | Metadata database: DAG runs, task states, users, XComs |
+| `redis` | Message broker that passes tasks from the scheduler to the workers |
+| `airflow-apiserver` | Web UI and REST API on http://localhost:8080 |
+| `airflow-scheduler` | Decides which tasks are ready to run and queues them |
+| `airflow-dag-processor` | Reads the files in `dags/` and turns them into DAGs |
+| `airflow-worker` | Runs the task code (the functions in `lab.py`) |
+| `airflow-triggerer` | Handles deferrable tasks that wait on outside events |
+| `airflow-init` | Runs once: creates the database tables and the `airflow` admin user |
+| `airflow-cli` | Optional, for running `airflow` commands (only starts with `--profile debug` or `docker compose run`) |
+| `flower` | Optional Celery monitoring UI on port 5555 (only starts with `--profile flower`) |
+
+All Airflow containers mount `dags/`, `logs/`, `config/`, `plugins/` and
+`working_data/` from this folder, so edits to the DAG are picked up without a
+rebuild and the outputs appear on your machine.
+
+---
+
 ## How to Run
 
-You need Docker Desktop with at least 4 GB of memory for Docker.
+### Prerequisites
 
-1. Set up (creates folders and `.env`, builds the image, initializes the database):
-
-    ```sh
-    ./setup.sh
-    ```
-
-2. Start Airflow:
+- Docker Desktop (or Docker Engine with the compose plugin), running.
+- At least 4 GB of memory for Docker (8 GB is better). To check how much Docker has:
 
     ```sh
-    docker compose up -d
+    docker run --rm "debian:bookworm-slim" bash -c 'numfmt --to iec $(echo $(($(getconf _PHYS_PAGES) * $(getconf PAGE_SIZE))))'
     ```
 
-3. Open http://localhost:8080 and sign in with `airflow` / `airflow`.
+- Port 8080 free.
 
-4. Find `Customer_Segmentation_RFM`, turn it on and click **Trigger**. A run takes
-   about 20 seconds.
+### Step 1: Get the code
 
-5. The results are in `working_data/`: `segment_report.json`,
-   `customer_segments.csv`, `model.sav` and `preprocessor.pkl`.
+```sh
+git clone https://github.com/PavanchytanyaD/mlops-airflow-customer-segmentation-lab.git
+cd mlops-airflow-customer-segmentation-lab
+```
 
-6. Stop Airflow:
+### Step 2: Set up
 
-    ```sh
-    docker compose down
-    ```
+```sh
+./setup.sh
+```
 
-### Running the tests
+This stops any earlier run and removes its volumes, creates `logs/`, `plugins/`,
+`config/` and `working_data/`, writes your user ID to `.env` (so files Airflow
+creates are owned by you), builds the image from the `Dockerfile`, and runs
+`airflow-init` to set up the database and the admin user. The first build downloads
+the Airflow image and takes a few minutes.
+
+### Step 3: Start Airflow
+
+```sh
+docker compose up -d
+```
+
+Wait until every service shows `(healthy)`, usually 1 to 2 minutes:
+
+```sh
+docker compose ps
+```
+
+### Step 4: Open the web UI
+
+Go to http://localhost:8080 and sign in with username `airflow` and password
+`airflow`. `Customer_Segmentation_RFM` is in the Dags list, paused.
+
+### Step 5: Run the DAG
+
+Turn on the toggle next to `Customer_Segmentation_RFM`. Because the DAG is scheduled
+weekly with `catchup=False`, Airflow starts one run for the latest week right away.
+To start another run at any time, click **Trigger**.
+
+The same from the command line:
+
+```sh
+docker compose exec airflow-scheduler airflow dags unpause Customer_Segmentation_RFM
+docker compose exec airflow-scheduler airflow dags trigger Customer_Segmentation_RFM
+```
+
+A run takes about 20 seconds.
+
+### Step 6: Follow the run
+
+- **Grid** view: one column per run, one square per task (green means success).
+- **Graph** view: the four tasks and their dependencies (screenshot above).
+- Click a task, then **Logs**. The `load_model_task` log prints the chosen k, the
+  silhouette scores, the segment table and the test predictions.
+
+From the command line:
+
+```sh
+docker compose exec airflow-scheduler airflow dags list-runs Customer_Segmentation_RFM
+docker compose exec airflow-scheduler airflow tasks states-for-dag-run Customer_Segmentation_RFM <run_id>
+```
+
+Task logs are also saved on your machine under
+`logs/dag_id=Customer_Segmentation_RFM/run_id=<run_id>/task_id=<task>/`.
+
+![Grid view with four successful runs](assets/airflow_runs.jpg)
+
+### Step 7: Look at the results
+
+| File in `working_data/` | Contents |
+|---|---|
+| `segment_report.json` | SSE and silhouette for every k, chosen k, train and holdout silhouette, segment profiles, test predictions |
+| `customer_segments.csv` | Every customer with recency, frequency, monetary, train or holdout, cluster and segment name |
+| `customers_rfm.csv` | The RFM table written by the preprocessing task |
+| `model.sav` | The trained K-Means model |
+| `preprocessor.pkl` | The fitted log + standard scaling pipeline |
+
+### Step 8: Stop Airflow
+
+```sh
+docker compose down       # stop the containers, keep the database
+docker compose down -v    # stop and also delete the database volume
+```
+
+### Run the DAG once without the scheduler
+
+`dag.test()` runs all four tasks in one process, which is handy while changing the
+code. With the containers running:
+
+```sh
+docker compose exec airflow-scheduler python /opt/airflow/dags/customer_segmentation.py
+```
+
+---
+
+## Troubleshooting
+
+- **Port 8080 is already in use:** stop the other program, or change `"8080:8080"`
+  under `airflow-apiserver` in `docker-compose.yaml` to another port such as
+  `"8081:8080"`.
+- **Containers keep restarting or exit with code 137:** Docker is out of memory.
+  Give it more in Docker Desktop under Settings, Resources.
+- **The DAG is not in the list:** check for errors with
+  `docker compose exec airflow-scheduler airflow dags list-import-errors`. Airflow
+  looks for new files in `dags/` every 5 minutes, so a new DAG can take that long to
+  show up.
+- **Permission errors on `logs/` or `working_data/` (Linux):** make sure `.env`
+  contains `AIRFLOW_UID` with your user ID. `setup.sh` writes it.
+- **Warning that `FERNET_KEY` is not set:** expected for a local setup. It is only
+  needed to encrypt connection passwords and variables stored in Airflow.
+
+---
+
+## Running the Tests
 
 ```sh
 pip install -r requirements-dev.txt
 pytest
 ```
 
-The DAG structure tests need Airflow, so they are skipped outside the container. To
-run every test inside the Airflow image:
+The tests check the data cleaning, the RFM features, the segment names, the full
+four-task pipeline on the real data (outputs, scores, holdout silhouette and test
+predictions), and the DAG structure. The DAG tests need Airflow, so they are skipped
+outside the container. To run every test inside the Airflow image:
 
 ```sh
 docker compose run --rm -v "$PWD":/repo --entrypoint bash airflow-cli \
