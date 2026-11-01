@@ -1,0 +1,6 @@
+.venv/
+.git/
+logs/
+working_data/
+config/
+plugins/
