@@ -21,6 +21,7 @@ with DAG(
     description='RFM customer segmentation with K-Means on the Online Retail dataset',
     schedule='@weekly',
     catchup=False,
+    max_active_runs=1,  # runs share the files in working_data, so one at a time
     tags=['mlops', 'clustering'],
 ) as dag:
 
